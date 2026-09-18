@@ -1,0 +1,11 @@
+{
+  "n_train_samples": 1000,
+  "n_train_shards": 10,
+  "vocab_size": 103,
+  "epochs": 2,
+  "ctc_loss_final": 4.288794952392578,
+  "sr_dev_cer": 1.0,
+  "sr_test_cer": 1.0,
+  "pretrained_xlsr_53_thai_on_993_mixed_cer": 0.3795,
+  "paper_xlsr_thai_giga2_test_cer": 0.1391
+}

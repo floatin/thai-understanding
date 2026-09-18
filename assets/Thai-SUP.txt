@@ -1,0 +1,13 @@
+1. Data Collection         2. Data Augmentation
+
+      High-resource text                 ...
+      understanding data
+                           Deepseek
+
+
+4. Text to Speech          3. Text Translation
+
+     Low-resource speech                ...
+      understanding data
+                            Gemini
+

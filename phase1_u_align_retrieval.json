@@ -1,0 +1,14 @@
+{
+  "n_samples": 64,
+  "recall_at_1": 0.0625,
+  "diag_similarity": 0.06902854144573212,
+  "off_diag_similarity": 0.03411485254764557,
+  "similarity_ratio": 2.023416086859098,
+  "training_nce_loss": [
+    2.027157229423523,
+    1.655814522743225,
+    1.4001593325138093
+  ],
+  "recall_at_5": 0.25,
+  "recall_at_10": 0.453125
+}

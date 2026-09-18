@@ -1,0 +1,62 @@
+# ===== 基座模型权重(几十GB,不进 git) =====
+Qwen3-4B/
+Typhoon2-3B/
+XLSR-Thai/
+ZikXewen-thai-ctc/
+
+# ===== 训练数据集 =====
+Thai-SUP/
+
+# ===== 训练产物(checkpoints / adapter / 中间训练目录) =====
+u_align_stage2/
+u_align_stage2_v2/
+u_align_stage2_v3/
+u_align_stage2_v4/
+u_align_stage2_v5/
+u_align_stage2_v6/
+u_align_stage2_v7/
+u_align_stage2_v8/
+u_align_stage2_v9/
+u_align_adapter/
+u_align_ctc_only/
+out_align/
+out_metric_gate/
+
+# ===== 中间产物(可由代码重新生成) =====
+ctc_drafts.json
+ctc_head_trained.pt
+ptt_eval_gen.json
+ptt_eval_metrics.json
+ptt_eval_metrics.partial.json
+ptt_eval_split.json
+ptt_train_split.json
+
+# ===== Vendored 工具(用户决定排除) =====
+MemoryCustodian/
+pi-autoresearch/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 编辑器 / 系统 =====
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== 环境变量 / 凭证(防止意外泄漏) =====
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secret*

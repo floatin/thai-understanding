@@ -1,0 +1,6 @@
+{
+  "n_samples": 987,
+  "pretrained_xlsr_53_thai_cer": 0.3783026597464288,
+  "xlsr_thai_mcshao_transferred_head_cer": 2.3776583863933984,
+  "paper_table1_giga2_xlsr_thai_ctc_cer": 0.1391
+}
