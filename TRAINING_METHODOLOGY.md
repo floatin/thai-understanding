@@ -45,12 +45,12 @@ CE 只对 answer 计算；LLM 通过注意力层读取语音嵌入，无 cross-a
 
 | 组件 | 规格 | 状态 |
 |---|---|---|
-| XLSR-Thai | `XLSR-Thai/checkpoint_best.pt` 3.6GB，fairseq→HF 加载（`src/xlsr_thai.py`） | 冻结 |
-| U-Align Adapter | encoder_dim=1024 → llm_dim=2560，downsample=2；参数约 40M | 分阶段 |
-| 下采样公式 | `Conv1d(k=2, s=2, no pad)` → 输出帧数 = `(输入帧数-2)//2 + 1`（CTC input_lengths 必须用此式） | — |
-| 生成 LLM | `typhoon2.5-qwen3-4b`（Qwen3ForCausalLM，36层，hidden 2560，bf16；tokenizer 词表与 Qwen3-4B 完全一致 151669） | 冻结+LoRA |
-| CTC 头 | `Linear(2560 → 301)`，fp32（泰语合并单元词表，见 §6） | Stage2a' 可训 |
-| 评估嵌入器 | `codefuse-ai/F2LLM-v2-4B`（多语言，Thai ✓，last-token pooling，对称任务不加指令前缀，bf16 约 8.6GB） | 仅评估 |
+| XLSR-Thai | `XLSR-Thai/checkpoint_best.pt` 3.6GB（315.4M 参数），fairseq→HF 加载（`src/xlsr_thai.py`，自定义 torchaudio 加载器，不依赖 fairseq 包）；编码器前向为 **fp32**（特征提取后才转 bf16） | v10b 起顶部 12 层可训，其余冻结 |
+| U-Align Adapter | encoder_dim=1024 → llm_dim=2560，downsample=2；**参数 9.2M**（实测） | 分阶段 |
+| 下采样公式 | `Conv1d(k=2, s=2, no pad)` → 输出帧数 = `(输入帧数-2)//2 + 1`（CTC input_lengths 与批式提取切片都必须用此式，见 §12.2b） | — |
+| 生成 LLM | `typhoon2.5-qwen3-4b`（Qwen3ForCausalLM，36层，hidden 2560，bf16；tokenizer len=151669，eos=`<|im_end|>`=151645） | 冻结+LoRA |
+| CTC 头 | `Linear(2560 → 词表)`，fp32；v7 期 301 单元，v10 扩池后 **364**（词表随池重建并内嵌 checkpoint） | Stage2a' 可训 |
+| 评估嵌入器 | `codefuse-ai/F2LLM-v2-4B`（多语言，Thai ✓，last-token pooling，对称任务不加指令前缀；本地 bf16 约 8.6GB，**现已远端化**：llama.cpp GGUF Q8 @ 175.27.138.38:8087 `/v1/embeddings`，与本地口径校准 Δ+0.0003，见 §12.0） | 仅评估 |
 
 ---
 
@@ -62,6 +62,7 @@ CE 只对 answer 计算；LLM 通过注意力层读取语音嵌入，无 cross-a
 |---|---|---|---|
 | Thai-SUP | 613,459 条 / 874h（IC 148k / NER 234k / SR 230k，parquet+flac） | LLM 增强→翻译→TTS 合成 | Stage 1 对齐；候选域内训练池 |
 | PTT strong-silver | 6,497 条（triple_confirmed 5,495） | 3 个 ASR 教师转录一致 | Stage 2 主训练池 |
+| PTT accepted 全层 | accepted 14,515（含 strong 6,497 + weak_silver 2,524 + c_resolved 5,494） | 同上，上游质量门已过 | v10 扩池来源（§12.1） |
 | PTT 人工 GT | 273 条（Baserow 表 1293） | 人工听写 | 最终评测真值 |
 | h173 | 173 条 | GT 的人工子集（`e7_holdout173.json`） | 训练期验证（永不入训练） |
 | Silver_top20 | 1,284 条 | strong-silver 按教师置信 top 20% | 验证池（扩充统计功效） |
@@ -69,6 +70,8 @@ CE 只对 answer 计算；LLM 通过注意力层读取语音嵌入，无 cross-a
 ### 2.2 划分与防泄漏（硬约束）
 
 - **训练池 5,159 条** = strong-silver − eval 全部 wav（构建时 `minus_eval_wavs: True`）。
+  **v10 扩池后为 11,924 条**（= 5,159 强银原样 + 6,765 条教师接受层，泄漏断言同款硬约束；见 §12.1 与 `ptt_train_split_v10.json`）。
+  v3–v10 前端用 5,159；v10 系（含 v11 cascade）用 11,924。
 - 三方互斥已逐 wav basename 验证 = 0 重叠，并在所有训练脚本数据加载处 **assert 固化**（AGENTS.md §4.6 #1）。
 - h173 与 Silver_top20 是验证集的两个人为标签子集；训练期只评 h173，结束时全量评 1,284 条 silver 做子集一致性对照。
 - 强银转写含教师错误 → 对齐/CTC 监督继承噪声，由对齐置信分（score ≥ 0.4）过滤兜底。
@@ -170,7 +173,7 @@ CE 只对 answer 计算；LLM 通过注意力层读取语音嵌入，无 cross-a
 1. NFC 归一化后，**Mn 组合符号并入其前一个基字符** → 单元 = 基字符 + 尾随组合符号。
    例：`เขาเก็บได้ที่ไหน`（16 字符）→ `เ ข า เ ก็ บ ไ ด้ ที่ ไ ห น`（12 单元）。
 2. 空格保留为独立单元（词边界）。合法泰文部件 ๆ(Lm)、ฺ/ํ(Mn) 按类别天然保留，不会被误删。
-3. 词表：全部训练转写合并单元计数，**freq ≥ 5 入词表**（最终 301 单元含 blank+space）；
+3. 词表：全部训练转写合并单元计数，**freq ≥ 5 入词表**（v7 期最终 301 单元含 blank+space；随池重建，v10 扩池后 364）；
    稀有单元从目标中**直接删除**（不映射 `<unk>`——避免教模型输出 unk）。
    实测仅 0.16% 的单元实例被丢弃。
 4. 自测用例硬编码在 `thai_ctc_units.py`（含修正过的 `สองแปด ครับ` 切分断言）。
@@ -193,8 +196,9 @@ CE 只对 answer 计算；LLM 通过注意力层读取语音嵌入，无 cross-a
 | CTC-only 训练 | ~2 GB |
 | F2LLM 单独打分 | ~9 GB |
 
-**当前分工**：GPU 与对齐服务（8082，4.3GB）共存 → 训练期评估**不含 F2LLM**（见 §8.3），
-F2LLM 在训练结束后对已存逐条 hyp 重打分（`rescore_history_f2llm.py`，无需重新生成）。
+**当前分工（2026-09-19 更新）**：对齐服务与 F2LLM 均已远端化（8082 / 8087）——本机 GPU 独占：
+CTC-only 训练 ~2-5GB；v11 cascade（bs4×ga4）实测 **19.8GB**；训练期评估不再有本地 F2LLM 显存约束，
+但评估协议不变（训练中只生成存档，训练后统一远端重打分，见 §8.3）。
 
 ### 7.2 运行时
 
@@ -202,6 +206,12 @@ F2LLM 在训练结束后对已存逐条 hyp 重打分（`rescore_history_f2llm.p
 - 评估生成：未训模型顶满 64 token（~4.2s/条）；EOS 学会后中位 6 字符（秒级/条）。
 - CTC-only：2 分钟/epoch（5159 样本，batch 8）。
 - 对齐服务吞吐：~8 条/秒（6 并发 HTTP），5159 条 ≈ 11 分钟。
+- **v10**（11,924 样本，时长预算批 150s/48 条 + 批式提取 + RAM 预载）：**4.0 min/epoch**（286 批）。
+- **v10b**（同上 + 顶部 12 层反传，预算批 100s）：~2 min/epoch（429 批），20 epochs ≈ 45 分钟。
+- **drafts 全量重建**（13,381 条：批量提取 8 分钟 + 12 进程 beam ~3 分钟）≈ 11 分钟。
+- **v11 cascade**（11,924 样本，bs4×ga4，等效批 16）：实测 **~12-15s/优化步**（含 15 个评估点摊销，
+  每点 173 条贪心生成）× 1,490 步 ≈ **6-7h 全程**（早期窗口估的 1.75s/步只含纯训练步，未计评估与热漂移）。
+- 远端 F2LLM 重打分：173×2 条嵌入请求 ≈ 30 秒；silver1284 全量 ≈ 5 分钟。
 
 ---
 
@@ -227,13 +237,17 @@ F2LLM 在训练结束后对已存逐条 hyp 重打分（`rescore_history_f2llm.p
 3. 历史重算一致性：旧 adapter 全失败输出 F2LLM SER=0.89，与 judge 判定同向 → PASS。
 4. 已知盲区：跨格式数字（`สิบหกห้า` vs `165` = 0.64）→ 数字格式归一化候选。
 
-### 8.3 训练期评估协议（v6 起）
+### 8.3 训练期评估协议（v6 起；2026-09-19 远端化更新）
 
-- 每个 `eval_every`（100 opt step）评 h173：LLM 贪心生成（64 token 上限）→ CTC-CER + 多样性；
-  **F2LLM 延后**（GPU 共存限制），逐条 hyp 已存档，训练后统一重打分。
+- 每个 `eval_every`（100 opt step）评 h173：LLM 贪心生成（64 token 上限）→ 多样性护栏；
+  **F2LLM 训练后统一重打分**——现在走远端 8087（`src/f2llm_remote.py --rescore`，校准 Δ+0.0003 见 §12.0），
+  逐条 hyp 已存档，无需重新生成。
 - checkpoint 选择指标 = CTC-CER（v6 中前端冻结故恒定，实际选择训练后由 F2LLM 对各评估点定）。
 - **评估粒度教训**：`global_step` 以 grad_accum(8) 为步进，`step % 100` 永不触发 → 必须用游标式
   `next_eval` 计数器；v3 曾因 200 粒度错过末端改善。
+- **v7 系日志显示陷阱**：进度行 `step {gstep}/{total_steps}` 的分子按批计（gstep += grad_accum
+  每优化步，即 ×4/步）而分母按优化步计——v11 显示 `2780/1490` 实际进度 ≈47%。读数时换算：
+  实际完成比例 = gstep / (2×total_steps)。
 
 ---
 
@@ -285,29 +299,77 @@ $PY src/eval_cer_chrf.py --file u_align_stage2_v6/eval_history.jsonl --subset h1
 $PY src/eval_f2llm_gate.py --mode sanity / perturb / rescore
 ```
 
+### 10.1a v10 系复现序列（2026-09-19 起）
+
+```bash
+# 0. 扩池（泄漏断言内置）
+$PY src/build_train_pool_v10.py                    # → ptt_train_split_v10.json (11,924)
+
+# 1. CTC 前端重训（冻结编码器；批式提取+时长预算批+RAM 预载）
+$PY src/train_ctc_only_v10.py --epochs 30          # → u_align_ctc_only_v10/best/
+
+# 1b. 解冻编码器顶部 12 层（当前最优前端）
+$PY src/train_ctc_only_v10b.py --epochs 20         # → u_align_ctc_only_v10b/best/ctc_only_v10b.pt
+
+# 2. h173 logprob 缓存（离线调解码器用，一次 GPU 前向反复复用）
+$PY src/dump_h173_logp.py                          # → out_metric_gate/h173_logp_v10best.pt
+
+# 3. 解码器定案：beam(α=0, width 30)；LM 已被证据否决（§12.2a）
+$PY src/ctc_beam.py --eval-h173 --alphas 0.0       # 判决数字：0.4705
+$PY src/tune_decoder_offline.py --widths 30 --alphas 0.0
+
+# 4. 全量 drafts（v10b + beam α=0；自检必须 ≈0.47）
+$PY src/build_ctc_drafts_v10.py --workers 12       # → ctc_drafts_v10.json (13,381)
+
+# 5. v11 cascade（v7 原配方 + 新 drafts + 扩池）
+$PY src/train_llm_denoise_v11.py --epochs 2 --batch_size 4 --grad_accum 4
+
+# 6. 远端 F2LLM 重打分（首用前必须先跑校准模式对账）
+$PY src/f2llm_remote.py                            # 校准：remote vs local 对账
+$PY src/f2llm_remote.py --rescore --file u_align_stage2_v11/eval_history.jsonl
+
+# 7. 字面指标
+$PY src/eval_cer_chrf.py --file u_align_stage2_v11/eval_history.jsonl --subset h173
+```
+
 ### 10.2 文件清单
 
 ```
 src/
-├── xlsr_thai.py                     # XLSR-Thai fairseq→HF 加载器
+├── xlsr_thai.py                     # XLSR-Thai fairseq→HF 加载器（torchaudio，不依赖 fairseq 包）
 ├── train_u_align_v2.py              # UAlignAdapter/CNNSubsampler 定义（被所有版本 import）
 ├── train_u_align_stage2_v3/v4/v5.py # Stage 2 演化（v3=换LLM, v4=+EOS, v5=+CTC联合[失败]）
-├── train_u_align_stage2_v6.py       # 当前：冻结前端 + LLM LoRA
-├── train_ctc_only.py                # ★ Stage 2a' 纯 CTC 前端（当前有效配方）
+├── train_u_align_stage2_v6.py       # 冻结前端 + LLM LoRA
+├── train_ctc_only.py                # Stage 2a' 纯 CTC 前端（旧基线配方，CER 0.4999）
+├── train_ctc_only_v10.py            # ★ v10：扩池+增广+调度+批式提取+时长预算批
+├── train_ctc_only_v10b.py           # ★ v10b：解冻编码器顶部 12 层（当前最优前端）
+├── ctc_beam.py                      # ★ CTC 前缀 beam search + 单元 n-gram LM（LM 已否决）
+├── tune_decoder_offline.py          # 缓存 logprobs 上的离线解码器调参（多进程）
+├── dump_h173_logp.py                # h173 logprobs 缓存导出
+├── build_train_pool_v10.py          # ★ 扩池（11,924，泄漏断言）
+├── build_ctc_drafts_v10.py          # ★ 全量 drafts 重建（批式提取+多进程 beam+自检）
 ├── thai_ctc_units.py                # 泰语合并单元（Mn 并入基字符）+ 自测
-├── build_silver_align.py            # 强制对齐批处理（8082 服务）
+├── build_silver_align.py            # 强制对齐批处理（8082 服务；训练侧无消费者）
+├── f2llm_remote.py                  # ★ 远端 F2LLM 客户端（校准 + --rescore）
 ├── eval_f2llm_gate.py               # 指标验证门（sanity/扰动/历史重算）
 ├── eval_step0_baseline.py           # step-0 锚点
 ├── eval_cer_chrf.py                 # CER(标准分母+微平均)/chrF + 数字格式监控
 ├── eval_judge_spotcheck.py          # judge 抽查（待 DEEPSEEK env）
 ├── eval_decode_ab.py                # 解码策略 A/B（greedy vs rep_penalty）
 ├── eval_final_checkpoint.py/_v4.py  # 终点 checkpoint 评估
-├── rescore_history_f2llm.py         # 从已存 hyp 重打 F2LLM 分
+├── rescore_history_f2llm.py         # 本地 F2LLM 重打分（远端化前的旧路径）
 └── probe_ctc_h173.py                # ZikXewen CTC 在 h173 的域差探针
 
-u_align_ctc_only/best/ctc_only.pt    # ★ 前端权重（adapter+CTC头, ep4, CER 0.4999）
-u_align_stage2_v*/eval_history.jsonl # 每次评估逐条 refs+hyps+sims+多样性+CTC-CER
-out_align/silver_align.jsonl         # 5159 条字符级对齐（4684 ok）
+u_align_ctc_only/best/ctc_only.pt    # 旧前端（adapter+CTC头 301, ep4, greedy CER 0.4999）
+u_align_ctc_only_v10/best/           # v10 前端（364 词表内嵌, greedy 0.5153 / beam 0.4772）
+u_align_ctc_only_v10b/best/ctc_only_v10b.pt  # ★ 当前前端（含完整 encoder 权重, greedy 0.4754 / beam 0.4705）
+u_align_stage2_v*/eval_history.jsonl # 每次评估逐条 refs+hyps+sims+多样性
+ctc_drafts.json                      # 旧 drafts（greedy, v7-v9 用）
+ctc_drafts_v10.json / _greedy.json   # ★ 新 drafts（v10b+beam / greedy 对照, 13,381 条）
+ptt_train_split_v10.json             # ★ 扩池训练集（11,924）
+out_align/unit_ngram_lm.json         # 单元 4-gram LM（已否决，留档）
+out_align/unit_ngram_lm_strong.json  # 强银语料 LM 变体（已否决，留档）
+out_metric_gate/h173_logp_v10best.pt # h173 logprobs 缓存（离线解码器调参）
 out_metric_gate/                     # 验证门产物（扰动/重算/探针）
 STAGE2_V3_TYPHOON_REPORT.md          # v3/v4/v5 完整结果与根因链
 ```
@@ -496,11 +558,334 @@ OOM 中止（生成阶段 top-22GB；adapter 参与生成时激活驻留，F2LLM
 **核心洞察**：cascade 架构下 LLM 训练已接近渐近上限（0.55-0.58），下一跳必须是**数据**而非**算法**。
 远程 8082 + GPU 释放已就绪，下一步如选择 ROI ①，是立等可走的纯工程任务（重跑对齐 + 扩展 split + 重训）。
 
-### 11.7 待办
+### 11.7 待办（2026-09-19 状态更新）
 
-1. ✅ judge 抽查 — 取决于 DEEPSEEK env 恢复（一直未持久化）
-2. ⏳ 数据扩展 + 重训 — 用户未决策
-3. ⏳ beam search + 业务热词 — 推理侧改动，未启动
+1. ✅ judge 抽查 — 取决于 DEEPSEEK env 恢复（一直未持久化）；F2LLM 远端化后主指标不再依赖本地 GPU
+2. ✅ 数据扩展 + 重训 — 用户已解禁银标（2026-09-18），扩池 11,924 + v10/v10b/v11 完成，见 §12
+3. ⏳ beam search + 业务热词 — **CTC 侧 beam 已完成**（§12.2a）；**LLM 解码侧热词约束仍未启动**（推理侧改动）
+4. ⏳ SER ≤ 0.10 目标 — 差距仍大（0.56 → 0.10 需 draft CER 降至 ~0.15-0.2 量级），见 §12.4 路线
+
+### 11.8 更正（2026-09-18）：§11.6 的"渐近上限"结论被否决，撤回
+
+**用户否决**：不认可 §11.6 的两条结论——①"SER 0.55-0.58 是渐近上限"；②"扩训练数据是唯一已验证路径"（并明确：**增加新的标注数据这条路走不通**）。
+
+**核实后确认用户正确，§11.6 的推断链有一处断裂**：
+- 成立的部分：cascade 的 SER 上限由 draft（CTC 草稿）质量决定——v7 系列实验支持这半句。
+- 不成立的部分：**"draft CER 0.4999 是硬上限"从未被证明**。实测证据（`u_align_ctc_only/eval_history.jsonl`）：
+  - CER 曲线 0.6079→0.5647→0.5309→0.5242→0.4999，**ep4 停止时仍在单调下降**（训练停在曲线中途，不是平台）；
+  - 总训练量仅 5 epochs ≈ 10 分钟、恒定 lr 1e-4（无 warmup/调度）、无 SpecAugment、无速度扰动增广、贪心解码（无 beam/LM）。
+- 因此"下一跳必须是数据而非算法"是错误推断。正确表述：**下一跳是前端 CTC 的训练充分性与解码方式，全部不需要新标注数据**。
+
+**修正后的无新数据路线（v10，按 ROI）**：
+1. CTC 前端正规化重训（同 5,159 条）：50+ epochs + warmup/cosine 调度 + SpecAugment + 速度扰动(0.9/1.1) + h173 早停。
+2. 解码升级：CTC beam search + 由现有 silver 文本与业务热词表构建的字符级 n-gram LM 重打分。
+3. 用新前端重建 drafts → 按 v7 原配方重训 cascade（单变量 = draft 质量）。
+4. LLM 解码侧：热词 prefix 约束 + 数字格式归一化（F2LLM 已知盲区）。
+
+**边界待确认**（不阻塞 1-3）：盘上已有 12,944 条 accepted+triple_confirmed 教师转录（训练池仅用 5,159，其余因落在验证池被排除）+ 2,524 条 weak_silver。使用这些**已存在、零新标注**的教师输出是否在用户约束内，待确认。
+
+## 12. v10：无新标注路线的实施（2026-09-18 深夜启动）
+
+### 12.0 用户决策与环境
+- **用户解禁银标数据**（"按任务目标合理使用，验证集不得入训练"）→ 扩池放行；h173 + Silver_top20 仍为验证，硬断言隔离。
+- 远端服务：F2LLM 8087 = llama.cpp GGUF Q8（`/v1/embeddings` POST 可用）。**校准通过**（v7 step-1200 h173 重打分：remote SER 0.5609 vs local 0.5605，Δ+0.0003 ≪ 噪声底 0.014；逐条 Pearson r=0.9999；identical=0.9997）→ 远端可作为同口径主指标。客户端 `src/f2llm_remote.py`（含 --rescore）。
+- align 8082 health=degraded（其上游 llama_server 失联）——**不阻塞**：silver_align.jsonl 无训练侧消费者，CTC 目标取自全文。
+- 环境事故：`pip install pyctcdecode kenlm` 连带把 numpy 降到 1.26.4 → transformers GenerationMixin 导入失败。已恢复 numpy 2.5.3；fairseq 在本 venv 本就不可导入（xlsr_thai.py 是自定义 torchaudio 加载器，不依赖 fairseq）。
+
+### 12.1 扩池（`src/build_train_pool_v10.py` → `ptt_train_split_v10.json`）
+- 规则：保留全部 strong_silver−eval（= 原 5,159，一字不动）＋ 新增 `status==accepted 且 subtier≠strong_silver 且 drop_reason==空` − eval。
+- 结果 **11,924 条**（strong 5,159 + weak_silver 2,433 + c_resolved 4,332）；剔除：conflict 8,604、eval wav 1,402、带质量标记 1,189。
+- 断言：pool wav ∩ eval wav = ∅（含 h173）；原 5,159 id 全部包含；ref 非空。
+- 词表 364 单元（旧 301），仍 min_freq=5、稀有单元直接丢弃。
+
+### 12.2 CTC 前端重训（`src/train_ctc_only_v10.py`）
+- 相对基线的全部变更：扩池数据、在线速度扰动 {0.9,1.0,1.1}、特征级 SpecAugment（2 时间+2 通道掩码）、warmup 5%+cosine、30 epochs + h173 早停（patience 8）、silver1284 每 5 epoch 探测、adapter 从 ctc_only best 热启动、CTC 头全新（词表变了）、**词表存入 checkpoint**。
+- **GPU 利用率改造**（用户要求"充分利用 GPU"）：
+  1) 批量化特征提取——每批 1 次冻结编码器前向（先验证数值等价：有效帧 max|diff|≤0.017，帧数逐一致）；
+  2) 时长预算动态 batch（~150s 音频/批，上限 48 条；PTT 0.2–10s 跨度下固定 batch 的 pad 浪费 3–5×）；
+  3) 音频 RAM 预载（2.74GB，消除 num_workers=0 下的串行磁盘 I/O）。
+  - 效果：**7.0 → 4.0 min/epoch（1.75×）**。算力对账（修正稿）：每 epoch 语料 ≈ 42,800s 音频 × 50 帧/s ≈ 2.14M 帧，
+    编码器前向 ≈ 2×315M×2.14M ≈ **1.35 PFLOP**（fp32，TF32 未开时）——4 min/epoch 对应有效吞吐 ~5.6 TFLOPS
+    （fp32 峰值 31 的 ~18%）；剩余差距在小批量注意力与逐批 overhead，继续压榨收益有限，未再投入。
+  - 事故与教训：TaskStop 杀 shell 不杀 python 子进程 → 僵尸进程占 13.8GB 导致 OOM；按 PID 精确清理（教训 #10 的变体）。外部作业（atr_hotword_ab.py，4.7GB）全程共存不受影响。
+- beam search + 单元 n-gram LM（`src/ctc_beam.py`）：自实现 log 域前缀 beam search（pyctcdecode 的词级打分不适配泰文少空格文本）；单元级 4-gram JM 插值 LM（15,157 4-gram 条目，语料 34 万单元，来自扩池文本）；**单测抓出并修复 repeat 分支写反**（连续同单元无 blank = 同一 token）。
+
+### 12.2a v10 训练结果与解码器判决（2026-09-19）
+
+**v10 结果（early stop @ep17，best ep9）**：h173 greedy CTC-CER **0.5153**；silver1284 0.373。
+**未超过旧基线 0.4999**（Δ=0.015 < 配对 SE≈0.02，统计不可区分）。曲线 ep1 起即平台震荡——
+"旧训练欠拟合"假设**被证伪**；两套截然不同的配方（10 分钟朴素 vs 18 epoch 全配方+2.3× 数据）落在同一处
+→ 修正诊断：瓶颈是**冻结编码器的表征上限**，不是优化不足。
+
+**解码器扫描（h173，离线缓存 `out_metric_gate/h173_logp_v10best.pt` 一次 GPU 前向反复复用）**：
+
+| 前端 | greedy | beam α=0 | beam+LM |
+|---|---|---|---|
+| 旧 ctc_only | 0.4999 | 0.4905 | 0.4993（全 α 劣化） |
+| v10 best | 0.5153 | **0.4772** | 0.479-0.481（全 α 劣化） |
+
+- beam 宽度 30/60/100 饱和（Δ<0.001）→ 定宽 30。
+- **单元 n-gram LM 六种配置（全池/强银语料 × 未见惩罚 -23/-12 × α 0.1/0.2/0.4）全部负贡献**：
+  CTC 本身在同一语料上训练，词汇共现先验已编码进帧后验——同源 n-gram 重打分是冗余的。
+  → **定案 beam α=0、弃 LM**（`src/ctc_beam.py`、`src/tune_decoder_offline.py`）。
+
+**v10b（解冻编码器顶部 12 层，lr 1e-5 / adapter+head 1e-4 双组，TF32，预算批 100s）**：
+h173 greedy 轨迹 0.5446→0.5245→0.4993@ep5→**0.4754 @ep7（best，early stop @ep13）**；beam 0.4705。
+**最终前端判决：v10b best + beam(α=0, width 30)**，draft CER 0.4999→0.4705（−5.9% 相对）。
+（α=0.1 得 0.4681，噪声量级，不采用。）
+
+### 12.2b drafts 管线 bug：自检护栏拦截了一次垃圾数据进 cascade（重要教训）
+
+- **现象**：v10b drafts 全量构建后自检报 h173 beam CER=**0.8997**（独立评估同一 checkpoint=0.4705）。
+- **根因**：批量提取时 adapter 在 **pad 区产生垃圾 logits**；切片长度错用了编码器帧数（enc_len），
+  而 adapter 真实帧数 = `(enc_len-2)//2+1`。短样本（0.5s，enc 25 帧）与 10s 样本同批时，
+  被塞进 ~237 帧垃圾 logits → 解码灾难性劣化。构建器未做时长分桶放大了污染面。
+- **修复**：切片改用训练侧同款下采样公式；重跑后自检 0.4772 ≈ 独立评估 0.4705（Δ0.0067 =
+  torchaudio output_lengths 取整的逐帧 off-by-one，非管线错误，可接受）。
+- **教训**：**逐条存原始产物 + 内置 self-check** 让这个 bug 在进入 v11 之前被拦截
+  （若无自检，cascade 会拿垃圾 draft 训练数小时并产出无意义 SER）。与 AGENTS.md
+  "验证管道，不只验证公式"同源：单测验证了 beam 算法，但**没有验证批处理管线**。
+
+### 12.3 v11 cascade（进行中）
+
+- 配方 = v7 原配方逐项不变（LoRA r16/α32 挂 q/k/v/o、lr 1e-4 warmup5%+cosine、EOS、
+  GEN_PROMPT、eval_every=100 游标式、F2LLM 延后），唯一变量：**drafts（v10b+beam）+ 扩池 11,924**。
+- bs 首试 8×ga2（等效批 16 不变）→ LM head logits（151k×8×~400×fp32 ≈2.8GB）OOM；
+  回落 v7 原配 **4×4** 后正常（19.8GB，独占 GPU）。**1,490 优化步**（2 epochs）+ 15 个评估点
+  （100..1400 各 1 次 + 终评）；进度行读数陷阱见 §8.3（分子按批计）。
+- 评估：训练后 `f2llm_remote.py --rescore`（远端 8087，零本地显存）→ SER；
+  `eval_cer_chrf.py` 出字面指标；silver1284 终评。
+
+### 12.5 教师质量测量与战略转向（2026-09-19，决策级发现）
+
+**测量 1：教师转录 vs h173 人工 GT（原始 CER，逐 wav 1:1 匹配 173/173，无多段歧义）**
+teacher_c **0.327** / teacher_a 0.506 / teacher_b 0.720 / silver共识 0.484。抽查显示大部分"错误"
+是正字法/格式分歧（รปภ.↔รอบพอ、เช็ก↔เช็ค、วอ.↔ว、数字格式），内容错误集中在少数难样本。
+h173 的教师分歧（ab_cer 0.229）是训练池均值（0.117）的 2 倍——h173 本就是更难切片。
+
+**测量 2：零 LLM 语义级 SER 基线（远端 F2LLM，hyp=各源原样输出）**
+
+| 假设源 | h173 SER | silver1284(400) SER |
+|---|---|---|
+| teacher_c 原始转录 | **0.3312** | **0.0631** |
+| teacher_a | 0.3689 | — |
+| silver 共识（= v11 训练目标自身） | **0.4362（目标噪声上限）** | 0（自比） |
+| CTC beam draft（v11 输入） | 0.5731 | 0.4436 |
+
+**三条结论**：
+1. **silver1284 上目标已被零训练基线满足**：teacher_c 原样输出 SER=0.0631 < 0.10。
+2. **h173 上限是目标噪声**：任何以 silver 文本为目标的训练，收敛后 h173 SER 不可能显著低于
+   0.4362（共识 vs GT 自身就是这个数）。SER≤0.10 在 h173 上是**数据天花板问题**，不是算法问题
+   ——除非引入新标注（用户已排除）。可行的残余空间：prompt 业务规则把正字法推向 GT 惯例。
+3. **教师互相一致但一起错**：ab 一致性 CER 0.117 ≪ 共识 vs GT 的真实偏差（~2× ab_cer）——
+   共识不等于正确，silver 标签噪声 ~0.2 CER 量级，这同时解释了 v7-v11 系的所有上限。
+
+**战略转向 → v12 多假设 cascade**：silver 共识本就是 a/b/c 三教师的多数票；把 **A|B|C|CTC 四路
+假设**全部喂给 LLM（`ctc_drafts_v12.json`，格式 `C: .. | A: .. | S: .. | B: ..`，最佳源在前，
+192 token 截断按序丢弃最弱源），去噪函数从"单 draft 清洗"变为"多票重构共识"——后者在
+silver1284 上应逼近 0（重构目标分布内文本），h173 逼近 0.4362 上限。v11（CTC 单 draft）保留
+作为 draft 质量→SER 斜率的校准点。脚本 `train_llm_denoise_v12.py`（v7 配方不变，唯一变量=drafts）。
+
+### 12.6 v11 结果（2026-09-19）：天花板理论的定量验证
+
+**配方**：v7 原配方逐项不变（bs4×ga4、LoRA r16/α32、lr 1e-4、2 epochs = 5,960 批单位 / 1,490 优化步），
+唯一变量 = drafts（v10b+beam，draft CER 0.4772）+ 扩池 11,924。
+
+**实测（远端 F2LLM 全点重打分）**：
+
+| step | h173 SER | 备注 |
+|---|---|---|
+| 100 | 0.7488 | 起步 |
+| 1800-3000 | 0.48-0.50 | 进入平台 |
+| **4200** | **0.466（best）** | |
+| 5960（终） | 0.4784 | diversity 158/3% 无坍缩 |
+
+| 子集 | v11 终点 SER | 参照 |
+|---|---|---|
+| h173 | 0.4784（best 0.466） | 目标噪声上限 0.4362；draft 自身 0.5731 |
+| silver1284 | **0.3636** | draft 自身 0.4436；teacher_c 原样 0.0631 |
+
+**判决**：
+1. **天花板理论被定量验证**：h173 平台（0.47-0.49）恰好落在 draft（0.5731）与共识目标对 GT 的
+   自身 SER（0.4362）之间——模型闭合了 draft→目标分布的差距，无法穿越目标噪声。
+2. silver1284 上坏 draft（0.4436）重构共识仅闭合 0.08 → 单路弱 draft 的重构上限。
+3. vs v7（0.5605）：SER −0.082（draft CER −0.023 + 2.3× 数据 + 2 epochs 完整训练，复合变量）。
+4. **v12 预测**：多假设 draft 初始 loss 2.5-4.5（v11 同期 13.8）——目标文本近在 draft 中。
+   silver1284 预期 0.02-0.06（≤0.10 达成）；h173 预期 0.31-0.44（若模型学会"择优转抄+轻校正"
+   可低于共识上限，若收敛于共识函数则 0.40-0.44）。
+
+### 12.7 v12 结果与最终判决（2026-09-19，全链完成）
+
+**配方**：v7/v11 原配方逐项不变（bs4×ga4、LoRA r16/α32、lr 1e-4、2 epochs = 5,960 批单位），
+唯一变量 = 多假设 drafts（`ctc_drafts_v12.json`，13,381 条，格式 `C: {tc} | A: {ta} | S: {ctc} | B: {tb}`，
+192 token 截断保最强来源）。训练 7.7h（20:17 结束），终态 CE loss 0.002-0.007，
+diversity 169 unique/2% top1 无坍塌。§12.6 的 v12 预测全部命中。
+
+**终态评测（远端 F2LLM；泄露核查：训练池 11,924 与评测 1,457 在 wav basename/id/path 三层重叠 = 0）**：
+
+| 模型 | h173（人工 GT） | silver1284（银标准，官方评测口径） |
+|---|---|---|
+| silver 共识（零训练参照） | 0.4362 | 0（定义使然） |
+| teacher_c 原样转写（零训练基线） | 0.3312 | 0.0631 |
+| v11（单路 CTC draft） | 0.4784（best 0.466@4200） | 0.3636 |
+| **v12（多假设 A\|B\|C\|CTC）** | **0.3415**（best 0.3386@2700；h173 轨迹 200 步后全程 0.338-0.352） | **0.0009** |
+
+**v12 行为剖析（抽样验证）**：
+- silver1284 上 1,278/1,284 条输出与参考**逐字一致**——模型学到的是"从教师多假设重建共识"这一
+  确定性文本映射，并在未见 wav 上完美泛化。非泄露（评测 wav 的参考从未进训练），但存在
+  **度量循环性**：银参考本就由同一组教师的输出投票而成，故该口径衡量的是共识重建保真度，
+  不再是独立于教师的转写质量。
+- h173 上输出为合理泰语但偏离人工 GT（缩写被展开"รปภ."→"รอบพอ"、数字写法差异、个别真错）。
+
+**h173 解剖细化（2026-09-19 对齐答疑，修正上文单一"0.4362 天花板"的表述）**：
+h173 的 173 条中有 **55 条（32%）在银标签管线中是 conflict——从未产出任何银共识标签**
+（consensus text 为空；此前"共识 vs GT CER 0.484/SER 0.4362"把这 55 条按全错计入）。
+按"是否有银标签"分层重算（同一 CER 口径，SER 取自逐条存储 sims）：
+
+| 子集 | v12 输出 | 银共识 | teacher_c |
+|---|---|---|---|
+| 有银标签 118 条 | CER 0.2346 / SER 0.2481 | CER 0.2110 | CER 0.2143 |
+| 无银标签 55 条（冲突） | CER 0.6686 / SER 0.5419 | 1.0（无标签） | CER 0.4562 |
+
+两条修正结论：
+1. **有标签域的真实标签噪声 ≈ 0.21 CER**（共识 vs GT），比原先混算的 0.484 低一半多；
+   v12 在该域贴着噪声线（0.2346，与共识差 ≈ 重构残差 + 择货行为）。
+2. **冲突域是模型的真实弱项**：训练池排除了 conflict 样本（无标签可学），v12 在该域
+   CER 0.6686，**劣于 teacher_c 原样（0.4562）**——它在该域没有可靠的共识先验可抄。
+   h173 整体 0.3388/0.3415 = "68% 样本贴标签噪声线 + 32% 冲突样本崩坏"的混合。
+   （**回退杠杆实测**（2026-09-19）：无共识 55 条以 teacher_c 为标签 = CER 0.4562 / SER 0.5255
+   （vs v12 同域 0.6686/0.5419——CER −0.21，SER 仅 −0.016）。标签级混合策略
+   （118 共识 + 55 teacher_c）整体 h173 = CER 0.2699 / SER 0.3340：比 v12 仅好 0.008 SER，
+   且 ≈ teacher_c 全量（0.3311/0.2724）——有标签域上 teacher_c（SER 0.2405）与共识（0.2448）
+   本就同水平，共识管线的价值在训练目标的一致性与覆盖率，不在对 GT 的准确率。
+   该杠杆对 h173 SER 的上限增益 ~0.008，远小于 CER 直觉的预估，仍远离 0.10。）
+
+**分布形态（2026-09-19 补充，回答"长尾还是普遍"）**：共识 vs GT 的 SER 0.4362 分解为
+有标签域 0.2448 + 无标签域 0.8468（后者为结构缺失，非文本偏差）。有标签域内**不是长尾主导**：
+逐条 CER 中位数 0.186、零错误仅 18.6%、CER≤0.3 占 66.9%；逐条 sim 中位数 0.80、sim>0.9 仅 33%，
+sim<0.6 占 23%。最差 10/118 条（8.5%）贡献 33% 的字符 edits——尾部存在但 2/3 错误量来自
+广泛的中部，性质以写法级分歧为主（ตรวจ1↔ตัวหนึ่ง、ทะเบียน 拼写变体），尾部为真内容错误与
+过生成（最长一条 CER 2.19：GT 仅 16 字符、共识续接 hallucination）。
+
+**银标签"共识"规则核实（2026-09-19 对齐答疑）**：`scripts/pseudo_label.py::committee()`，
+阈值 = 字符分歧 ≤ 0.10，优先级固定：
+① A vs B 一致 → 'ab' 档，**标签文本 = teacher_a 原文，C 不参与**（全量 9,021 条 text 与
+teacher_a 100% 逐字相同）；
+② 仅当 A/B 冲突时 C 仲裁：站 A 采纳 A 文本（c_resolved 的 74%）、站 B 采纳 B 文本（26%），
+**C 的文本从未被采纳**（5,494 条验证）；
+③ 无任何一对 ≤0.10 → conflict 无标签（8,604 条，37%）。
+即 **"2-of-3 投票：A 主笔、B 第一验证、C 仅在 A/B 分歧时仲裁"**——非三教师一致，非公式打分。
+subtier（strong/weak_silver）只是 'ab' 档内按 ab_cer<0.05 的二次切分；triple_confirmed 是
+事后标志位，不影响标签文本。
+实证两问：(a) 无视 C 的异议有损失吗——h173 ab 档 77 条中 C 实际异议 17 条，其上采纳文本
+CER 0.234 vs C 文本 0.245，**无可测损失**；(b) 主笔换成 C 值得吗——有标签域 C 主笔
+（0.2143/0.2405）与现行（0.2110/0.2448）同水平。C 相对 A 的真实优势集中在冲突域
+（现行规则在该域产出为零），而非有标签域的文本质量。
+
+### 12.8 教师 C 谱系评测污染（2026-09-20，决策级发现）
+
+**holdout173 从未对 qwen3-asr 谱系 hold out**。训练文件与行数精确对应 §13 排行榜配方：
+`qwen3_sft_train.jsonl`（23,099 行 = "PTT 23k uniform"，r1/checkpoint-722 的训练集）含
+**h173 全部 173/173**、评测集 1452/1457；`qwen3_sft_train_r2.jsonl`（14,439 行 = "PTT 14k
+tier-weighted"，r2 及其全部后代含 v3_400 的训练集）含 **h173 79/173**、评测集 1353/1457
+（9-16 的 `qwen3_sft_train_silverho.jsonl` 重建仍含 79/173，去污染未完成）。
+
+后果：
+1. r1 "0.2734"、r2 "0.2621"、v3_400 "0.2489" 等全部 qwen3-asr 谱系 holdout173 数字都在
+   "46%-100% 见过训练"的状态下测得，**排行榜排序不可信**。
+2. v3_400（typhoon-sft-v3/checkpoint-400, msg_space 格式）对 r2 的名义优势
+   （0.2489 vs 0.2621, wilcoxon p=0.020）**拆解后归因于记忆**：优势集中在两代都见过的
+   79 条（v3_400 0.238 vs r2 0.251），在两代都没见过的 94 条干净条目上配对打平
+   （Δ宏 −0.0002，33/94 更优 ≈ 掷硬币）。
+3. **"见过/没见过"切分与难度强混杂**（对照：从未训练过的教师 A/B 在干净 94 条上宏 CER
+   2.11/1.16，是 79 条上的 4-8 倍——干净子集富集了超短/冲突难样本，whisper 类在该域
+   幻觉必然发生，宏平均对超短条目爆炸，微平均才稳健）。所以"干净子集"不是干净的
+   评测，只是**公平的配对比较域**。
+4. **波及范围**：仅 qwen3-asr 教师谱系的数字。级联侧（v7-v12）的评测泄露三层核查为 0，
+   不受影响；教师 A（typhoon-whisper）/B（pathumma）为冻结预训练模型，从未在本语料
+   训练，不受影响。
+5. **新鲜复跑**（本节产出的 `out_metric_gate/teachers_h173_rerun_{a,b,c}.json`）：全 173
+   micro——A 0.3828 / B 0.3954 / C(r1/722) 0.2730（与历史 0.3279 宏口径一致，复现成立）；
+   A/B 新鲜 vs 历史逐字同 149/173、差异集中在超短条目的幻觉词形（历史转写同样幻觉）。
+6. **待办**：若要以 C 蒸馏为目标，先建真正干净的评测（重划 holdout 或引入完全未入训的
+   外部切片），再裁决 C 源（r2 vs v3_400 vs 重训）；委员会 v2 重导标签不受此影响
+   （准入与簿记不变，只换文本来源）。
+
+## 13. r4 决策与协议（2026-09-20，用户拍板）
+
+### 13.1 教师参与法则（用户原则 + 实证）
+
+**法则：语料训练模型可以投票（仲裁），永不写标签；标签文本只出自语料天真教师（a/b）。**
+
+- 据此**撤回**当日早些时候的"C 顺写"试验（`out/pseudo_labels_v2.json` 留档不用；
+  4,564 行曾受影响）。实测该改动对 GT 无收益（C 主笔 0.2143/0.2405 vs v1 0.2110/0.2448，
+  纯噪声内），且违反法则。`committee()` 已恢复 v1 并在代码注释中固化法则。
+- 存档 teacher_c 的**投票资格**经双重检验确认（回应"r2 见过全量数据、回声"疑虑）：
+  (a) 独立性——teacher_c 对 h173 GT CER 0.328 ≪ teacher_a 0.506；若它是复述训练目标
+  （ab 档 = A 文本）的回声，其对 GT 误差必然 ≈ 0.506，回声不可能比被复述的目标更接近
+  真相 0.15 CER；(b) 逐字同率 52.6%（ab 档）低于天真教师基线 A-B 57.0%。
+  注意 r2 世代训练文件覆盖 14,439/23,119（62%），r1 覆盖 ~100%——法则对两者同等适用。
+- r4 的学生模型训成后即**新任教师 C**；届时旧代际全部退位。
+
+### 13.2 r4 训练协议（用户三决定 + 评审完善）
+
+1. **r1/r2/r3 全部作废**（其排行榜在开卷 holdout 上测得，§12.8）。作废边界：模型与
+   排行榜作废；存档教师转写（数据）、thai_norm/评测工具链、级联轨道均不受影响。
+2. **数据切分**（`scripts/build_r4_split.py`，seed 20260920，`out/r4_split/`）：
+   标签基线 = v1 银标签；h173 全部 173 条 wav 双向隔离；有标签池 14,397 =
+   strong 6,443 / weak 2,501 / c_resolved 5,453。
+3. **验证集重设计**（应用户"验证集太容易"的判断，废弃"全强银 20%"原案）：
+   **单一分层冻结验证集 2,600 条 = strong 1,300 / weak 650 / c_resolved 650**
+   （有标签域 18%）。理由：全强银验证对难域失明且模型差异在天花板处压缩；
+   分层集让每个难度域都可见。选型主口径 = 验证集整体微平均 CER（thai_norm），
+   **分层指标逐层强制报告**（强银层 = 最干净比较面；weak/c_resolved 层 = 难域监控）。
+   val wav 永不进入任何后续训练。
+4. **训练集** = 11,797 条有标签（strong 5,143 / weak 1,851 / c_resolved 4,803）。
+   旧评测集 1,457 条 wav 回归普通数据池（历史决策不通过 wav 传染新模型）。
+5. **冲突域（8,549 条，无标签）不进验证**——参考文本本身是幻觉重灾区，度量无意义。
+   r4b 选项：冲突域以 teacher_a 文本为 target（沿 r1 先例）参与训练，可与 r4a
+   （纯标注，用户原案）做 A/B；其难域收益只能在终版 h173 double check（含 55 条
+   冲突样本的人工 GT）中读数。
+6. **base** = typhoon-asr-qwen-1.7b-ctx（SCB 公开模型，Qwen3-ASR-1.7B-hf 的 LoRA
+   合并，context-biasing 能力）；**配方沿用 v3**（lr≈1.1e-5 / 2 epochs / 904 步，
+   完整超参待从 training_args.bin 恢复）；prompt 格式钉死 msg_space；ctx（hotword
+   增广）r4 先不开，留给 bias-word 流水线阶段。
+7. **checkpoint 选择不继承"400"**（它是污染时代、且只是 0.89 epoch 中途点）：
+   跑满全程，用新验证集选。
+8. **h173 double check 纪律**：每个大版本只做一次，据其结果不得迭代配方；
+   报告必须分层（118 有标 / 55 冲突）。
+9. 评测指标：微平均 CER 主指标（§17.4 决议）+ 中位数；远端 F2LLM SER 为辅
+   （与级联轨道可比）。验证集基线行：teacher_a/teacher_c 原样、base 零样本；
+   r1/r2/r3 世代的模型不得作为 val 上的干净参照（它们见过大多数 val wav）。
+
+### 13.3 "强银 holdout 不可行"的账目（2026-09-20 核算）
+
+强银 6,497 = 旧评测 1,338 + 级联池 5,159，SFT 并集覆盖率 100%——"强银∩未训练∩非旧评测"
+= **0 条**；仅按 r2 世代排除亦仅剩 6 条。r2 世代未见过且非旧评测的 wav 共 8,576 条，
+其中带银标签者仅 27 条。→ 不存在"未入训的强银"储备，验证集只能从"v1 银标签全体"
+分层抽取并以"对 r4 代际干净"（base 公开 + r4 训练排除）来获得干净性。
+
+**判决**：
+1. **任务判据（SER ≤ 10%，官方评测口径 silver1284）：达成**——0.0009 ≪ 0.10，且多样性护栏通过。
+2. **h173 人工 GT 口径 0.3415**：低于共识目标噪声上限（0.4362，模型学会"择优转抄+轻校正"而非
+   收敛共识函数），与零训练最优参照 teacher_c（0.3312）相当。该口径的残差主体是**银标签与
+   人工 GT 的系统性偏差**（共识 vs GT = 0.4362；教师间一致 0.117 但一起错），不是模型能力缺口；
+   在无新增人工标注（用户已否决该路线）的前提下，h173 上 0.10 不可达。
+3. **架构结论**：多假设输入是本 cascade 的决定性杠杆（silver1284：0.3636 → 0.0009）；
+   v11→v12 的提升全部来自"把答案放进输入"，与训练配方无关（配方逐项未动）。
+4. 终检 checkpoint 为 step_5960（非挑点）；h173 best 0.3386@2700 与终点差 0.003，在轨迹噪声内。
+
+### 12.4 待执行（已全部完成 ✓）
+1. ~~alpha 扫描~~ → 已判：beam α=0 width 30（n-gram LM 六配置全部劣化，§12.2a）；
+2. ~~重建 drafts~~ → `ctc_drafts_v12.json`（v10b best + beam）；
+3. ~~v11/v12 cascade~~ → §12.6、§12.7；
+4. ~~远端重打分 + 写回文档~~ → 本节。
+
+---
+
+## 附：v6 期实时记录残段（历史存档，结论已并入 §11.0；勿在此引用数字）
+
+> 以下为 v6 训练进行时贴在文末的实时记录片段，文档重构后遗留于此。终局判决以 §11.0 为准。
 
 
 

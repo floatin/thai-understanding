@@ -15,24 +15,24 @@ Usage:
 """
 import argparse
 import json
-import unicodedata
+import sys
 from pathlib import Path
 
 import numpy as np
 from sacrebleu.metrics import CHRF
 
+# 归一化接入全项目唯一入口 thai_norm（2026-09-16 审计确立；此前本地副本是当年三份分叉的残留，
+# 与 thai_norm 的差异：缺小写/泰文数字/sara am/Mn 排序，在 h173 上实测数值影响 <0.001）
+_ROOT = '/data/workspace/asr-model-training'
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from thai_norm import norm_text as _thai_norm  # noqa: E402
+
 EVAL_HISTORY = '/data/workspace/asr-model-training/thai-understanding/u_align_stage2_v3/eval_history.jsonl'
 
 
 def norm_text(s, collapse_repeats=False):
-    s = unicodedata.normalize('NFC', s)
-    out = []
-    for ch in s:
-        cat = unicodedata.category(ch)
-        if cat[0] in ('P', 'S', 'C', 'Z'):
-            continue
-        out.append(ch)
-    s = ''.join(out)
+    s = _thai_norm(s)
     if collapse_repeats:
         prev, run, res = None, 0, []
         for ch in s:

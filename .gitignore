@@ -17,19 +17,28 @@ u_align_stage2_v6/
 u_align_stage2_v7/
 u_align_stage2_v8/
 u_align_stage2_v9/
+u_align_stage2_v10/
+u_align_stage2_v11/
+u_align_stage2_v12/
 u_align_adapter/
 u_align_ctc_only/
+u_align_ctc_only_v10/
+u_align_ctc_only_v10b/
 out_align/
 out_metric_gate/
 
 # ===== 中间产物(可由代码重新生成) =====
 ctc_drafts.json
+ctc_drafts_v10.json
+ctc_drafts_v10_greedy.json
+ctc_drafts_v12.json
 ctc_head_trained.pt
 ptt_eval_gen.json
 ptt_eval_metrics.json
 ptt_eval_metrics.partial.json
 ptt_eval_split.json
 ptt_train_split.json
+ptt_train_split_v10.json
 
 # ===== Vendored 工具(用户决定排除) =====
 MemoryCustodian/
